@@ -1,16 +1,20 @@
-using ITensors, ITensorMPS, HDF5
+#Code for calculating the expectation value of energy flux at variable x in order to check lightcone conditions
+
+using ITensors, ITensorMPS, LinearAlgebra, HDF5
+ITensors.disable_threaded_blocksparse() #Disables block sparse multithreading
+BLAS.set_num_threads(parse(Int, ARGS[1])) #Enables multithreading with BLAS
 
 ### Initial Parameters ###
-N = parse(Int, ARGS[1]) #Number of lattice sites per dimension
+N = parse(Int, ARGS[2]) #Number of lattice sites per dimension
 d = 1 #Number of spatial dimensions
-Dim = parse(Int, ARGS[2]) #Truncated local Hilbert space dimension
-a = parse(Float64, ARGS[3]) #Lattice spacing
+Dim = parse(Int, ARGS[3]) #Truncated local Hilbert space dimension
+a = parse(Float64, ARGS[4]) #Lattice spacing
 
 n_0 = round(Int, ((N-1)/2)) #Index of the point at the center of the lattice (0-based indexing).
 
-mass = parse(Float64, ARGS[4])
-m0 = parse(Float64, ARGS[5]) #Basis frequency
-l = parse(Float64, ARGS[6]); #phi^4 coupling strength
+mass = parse(Float64, ARGS[5])
+m0 = parse(Float64, ARGS[6]) #Basis frequency
+l = parse(Float64, ARGS[7]); #phi^4 coupling strength
 
 ### Field Operator $\phi(\mathbf{x})$ and $\pi(\mathbf{x})$ ###
 function a_matrix(D)
@@ -54,9 +58,9 @@ end
 
 H_OS = H0 + HInt #Full Hamiltonian OpSum
 
-if parse(Bool, ARGS[10])
-    EEC_MPS = h5open("1d_EEC_MPS/N=$N,a=$a,l=$l,m=$mass", "r")
-    sites = EEC_MPS["sites"]
+if parse(Bool, ARGS[12])
+    EEC_MPS = h5open("1d_EEC_MPS/N=$N,a=$a,dim=$Dim,l=$l,m=$mass", "r")
+    sites = read(EEC_MPS, "sites", Vector{Index{Int64}})
     H = MPO(H_OS, sites);
     vac = read(EEC_MPS, "vac", MPS)
     close(EEC_MPS)
@@ -72,22 +76,15 @@ else
     cutoff = [1E-10]
     energy, vac = dmrg(H,psi0;nsweeps,maxdim,cutoff)
 
-    EEC_MPS = h5open("1d_EEC_MPS/N=$N,a=$a,l=$l,m=$mass", "w")
-    EEC_MPS["sites"] = sites
+    EEC_MPS = h5open("1d_EEC_MPS/N=$N,a=$a,dim=$Dim,l=$l,m=$mass", "w")
+    write(EEC_MPS, "sites", sites)
     write(EEC_MPS, "vac", vac)
     close(EEC_MPS)
 end
 
 ### Energy Flux Operator ###
-#Function for applying the T_{0i}(x,t) operator.
-#Params: state to apply T_{0i} on, time of measurement, position of detector (as a tuple)
-function T0i(state, t, r; dir=0, nsteps=1, maxdim=200, cutoff=1e-8)
-    psi = copy(state)
-
-    #Apply exp(-iHt). (I am using the forward time evolution convention, but 2604.26226 uses the inverse time evolution convention.)
-    psi = tdvp(H, -im*t, psi; nsteps=nsteps, maxdim=maxdim, cutoff=cutoff, normalize=false)
-
-    #Apply T_{0i}(x). (Specifically, T_{01}(x) in 1+1d)
+#Function for constructing the T_{0i}(x,t) MPO
+function T0i(r; dir=0)
     x = r[1]
 
     T0x_OS = OpSum()
@@ -100,18 +97,15 @@ function T0i(state, t, r; dir=0, nsteps=1, maxdim=200, cutoff=1e-8)
     end
 
     T0i_MPO = MPO(T0x_OS, sites)
-    psi = apply(T0i_MPO, psi)
 
-    #Apply exp(iHt)
-    psi = tdvp(H, im*t, psi; nsteps=nsteps, maxdim=maxdim, cutoff=cutoff, normalize=false)
-
-    return psi
+    return T0i_MPO
 end
 
-### Check Energy Conservation ###
-t_i = parse(Int, ARGS[7])
-t_max = parse(Int, ARGS[8])
-dt = parse(Float64, ARGS[9])
+### Calculate expectation value of the energy flux operator ###
+r = parse(Int, ARGS[8])
+t_i = parse(Float64, ARGS[9])
+t_max = parse(Float64, ARGS[10])
+dt = parse(Float64, ARGS[11])
 t_range = range(t_i, t_max, step=dt)
 
 #Define the excited state, \phi(0)\ket{\omega}
@@ -122,35 +116,33 @@ phi0 = MPO(phi0_OS, sites)
 psi = apply(phi0, vac) #Excited state
 norm_psi = inner(psi, psi)
 
-H_0_OS = OpSum() #Hamiltonian OpSum at index n_0 (i.e. x=0)
-H_0_OS += a^d/2, "pi2", n_0+1
-H_0_OS += a^d/2 * mass^2, "phi2", n_0+1
-H_0_OS += l/factorial(4) * a^d, "phi4", n_0+1
-H_0_OS += a^d * 1/(a^2), "phi2", n_0+1
-H_0_OS -= 1/2 * a^d * 1/a^2, "phi", n_0+1, "phi", (n_0+1)+1
-H_0_OS -= 1/2 * a^d * 1/a^2, "phi", n_0+1, "phi", (n_0+1)-1
-H_n_0 = MPO(H_0_OS , sites)
-
-function CalcEdens0(t; nsteps=1, maxdim=200, cutoff=1e-8)
-    psi_t = tdvp(H, -im*t, psi; nsteps=nsteps, maxdim=maxdim, cutoff=cutoff, normalize=false)
-    evH = inner(psi_t', H_n_0, psi_t) / norm_psi
-    return evH
+maxdim=200
+cutoff=1e-8
+time_step=0.1
+Eflux = ComplexF64[]
+open("Time Logs/EFEV2_Timed,N=$N,a=$a,l=$l,m=$mass,r=$r,ti=$t_i,tf=$t_max,dt=$dt.txt", "w") do io
+    println(io, "Elapsed Time - N=$N, a=$a, l=$l, m=$mass, r=$r, ti=$t_i, tf=$t_max, dt=$dt")
 end
-
-Edens0 = ComplexF64[]
-EfluxR = ComplexF64[]
-EfluxL = ComplexF64[]
 for t in t_range
-    evH = CalcEdens0(t)
-    evR = inner(psi, T0i(psi, t, 0, dir=1)) / norm_psi
-    evL = inner(psi, T0i(psi, t, 0, dir=-1)) / norm_psi
-    push!(Edens0, evH)
-    push!(EfluxR, evR)
-    push!(EfluxL, evL)
+    psiL, time, etc... = @timed tdvp(H, -im*t, psi; nsteps=round(Int, t/time_step), maxdim=maxdim, cutoff=cutoff, normalize=false)
+    open("Time Logs/EFEV2_Timed,N=$N,a=$a,l=$l,m=$mass,r=$r,ti=$t_i,tf=$t_max,dt=$dt.txt", "a") do io
+        println(io, "t=$t - Apply exp(-iHt): $time s")
+        println(io, ". . . - B. dims: $(linkdims(psi))")
+    end
+
+    psiR = copy(psiL)
+    if r >= 0
+        ev, time, etc... = @timed inner(psiL, T0i(r, dir=1), psiR) / norm_psi
+    else
+        ev, time, etc... = @timed inner(psiL, T0i(r, dir=-1), psiR) / norm_psi
+    end
+    open("Time Logs/EFEV2_Timed,N=$N,a=$a,l=$l,m=$mass,r=$r,ti=$t_i,tf=$t_max,dt=$dt.txt", "a") do io
+        println(io, "t=$t - Calc. exp. val.: $time s")
+    end
+
+    push!(Eflux, ev)
 end
 
-EEC_data = h5open("1d_EEC_data/EVs,N=$N,a=$a,l=$l,m=$mass,ti=$t_i,tf=$t_max", "w")
-EEC_data["Edens0"] = Edens0
-EEC_data["EfluxR"] = EfluxR
-EEC_data["EfluxL"] = EfluxL
+EEC_data = h5open("1d_EEC_data/EFEV,N=$N,a=$a,l=$l,m=$mass,r=$r,ti=$t_i,tf=$t_max,dt=$dt", "w")
+EEC_data["Eflux"] = Eflux
 close(EEC_data)
